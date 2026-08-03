@@ -1,0 +1,126 @@
+pipeline:
+  agent:
+    label: any
+
+  environment:
+    APP_NAME: my-app
+    APP_REPO: https://github.com/company/my-app.git
+    GITOPS_REPO: https://github.com/company/gitops-repo.git
+    DOCKER_IMAGE: deepak/my-app
+    BUILD_VERSION: ${BUILD_NUMBER}
+
+  stages:
+
+    - stage: Checkout Source
+      steps:
+        - git:
+            url: https://github.com/company/my-app.git
+            branch: main
+            credentialsId: github-creds
+
+    - stage: Verify Code
+      steps:
+        - sh: |
+            echo "Validating repository..."
+            ls -la
+
+    - stage: Unit Test
+      steps:
+        - sh: |
+            mvn clean test
+
+    - stage: SonarQube Scan
+      steps:
+        - sh: |
+            mvn sonar:sonar \
+              -Dsonar.projectKey=my-app \
+              -Dsonar.login=${SONAR_TOKEN}
+
+    - stage: Quality Gate
+      steps:
+        - waitForQualityGate:
+            abortPipeline: true
+
+    - stage: Dependency Scan
+      steps:
+        - sh: |
+            dependency-check.sh \
+              --scan . \
+              --format HTML
+
+    - stage: Secret Scan
+      steps:
+        - sh: |
+            gitleaks detect --source .
+
+    - stage: Filesystem Scan
+      steps:
+        - sh: |
+            trivy fs . --exit-code 0
+
+    - stage: Build Artifact
+      steps:
+        - sh: |
+            mvn clean package -DskipTests
+
+    - stage: Docker Build
+      steps:
+        - sh: |
+            docker build \
+              -t ${DOCKER_IMAGE}:${BUILD_VERSION} .
+
+    - stage: Docker Image Scan
+      steps:
+        - sh: |
+            trivy image ${DOCKER_IMAGE}:${BUILD_VERSION}
+
+    - stage: Push Image
+      steps:
+        - withCredentials:
+            credentialsId: dockerhub-creds
+            usernameVariable: DOCKER_USER
+            passwordVariable: DOCKER_PASS
+
+        - sh: |
+            echo ${DOCKER_PASS} | docker login \
+              -u ${DOCKER_USER} \
+              --password-stdin
+
+            docker push ${DOCKER_IMAGE}:${BUILD_VERSION}
+
+            docker tag \
+              ${DOCKER_IMAGE}:${BUILD_VERSION} \
+              ${DOCKER_IMAGE}:latest
+
+            docker push ${DOCKER_IMAGE}:latest
+
+    - stage: Update GitOps Repository
+      steps:
+
+        - git:
+            url: https://github.com/company/gitops-repo.git
+            branch: main
+            credentialsId: gitops-creds
+
+        - sh: |
+            sed -i \
+            "s|image: .*|image: ${DOCKER_IMAGE}:${BUILD_VERSION}|g" \
+            apps/my-app/deployment.yaml
+
+            git config user.email "jenkins@company.com"
+            git config user.name "Jenkins"
+
+            git add .
+            git commit -m "Update image ${BUILD_VERSION}"
+            git push origin main
+
+  post:
+
+    success:
+      - sh: echo "Manifest updated successfully"
+
+    failure:
+      - sh: echo "Pipeline failed"
+
+    always:
+      - cleanWs
